@@ -1741,6 +1741,15 @@
         });
     }
 
+    function idbGetOne(storeName, id) {
+        if (!idbInstance) return Promise.resolve(null);
+        return new Promise((resolve, reject) => {
+            const req = idbInstance.transaction(storeName, 'readonly').objectStore(storeName).get(id);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
     // keepTs=true tylko dla danych z chmury/seedów – lokalne zmiany zawsze dostają nowy znacznik z zegara HLC
     function stamp(item, keepTs) {
         if (!keepTs || !item.updated_at) item.updated_at = nextStamp();
@@ -1787,6 +1796,7 @@
     async function saveRecord(storeName, item) {
         // Szpule, akcesoria, drukarki: historia wersji – przy synchronizacji widać, czy zmiany z dwóch urządzeń trzeba połączyć
         if (COUNTERS[storeName] && item.updated_at) item.vh = [...(Array.isArray(item.vh) ? item.vh : []), Number(item.updated_at)].slice(-40);
+        if (storeName === 'orders') await trackOrderLineage(item);
         await idbPut(storeName, item);
         upsertInState(storeName, item);
         // Ponowne utworzenie rekordu o tym samym ID (np. przychód po cofnięciu księgowania) unieważnia stary tombstone.
@@ -2329,6 +2339,8 @@ create trigger layervault_touch
 
     let supabaseClient = null;
     let supabaseClientKey = '';
+    const SYNC_POLL_MS = 60000;
+    let syncMergeNote = '';   // „Połączono zmiany…” – dopisywane do wpisu o udanej synchronizacji
     let syncInProgress = false;
     let syncPending = false;
     let currentSync = null;
@@ -2530,12 +2542,13 @@ create trigger layervault_touch
                 if (showNotification) showToast('Synchronizacja w toku...');
                 const pulled = await pullRemoteChanges();
                 const pushed = await pushLocalChanges(user);
-                logSync(`Synchronizacja OK – pobrano: ${pulled}, wysłano: ${pushed}.`);
+                logSync(`Synchronizacja OK – pobrano: ${pulled}, wysłano: ${pushed}.${syncMergeNote}`);
+                const mergeNote = syncMergeNote; syncMergeNote = '';
                 safeStorage.set('lv_last_sync_ok', String(Date.now()));   // świeża kopia w chmurze = bez przypomnień o kopii
                 updateCloudBadge('on', lastSyncText());
                 renderBanners();
                 if (pulled > 0) { refreshAllViews(); notifyOtherTabs(); }
-                if (showNotification) showToast(`Zsynchronizowano (↓${pulled} ↑${pushed}).`);
+                if (showNotification) showToast(`Zsynchronizowano (↓${pulled} ↑${pushed}).${mergeNote}`, mergeNote ? 6000 : undefined);
             } catch (err) {
                 const msg = (err && (err.message || err.details)) || String(err);
                 const hint = /relation|does not exist|schema cache|42P01|PGRST205/i.test(msg) ? ' → Uruchom skrypt SQL z instrukcji poniżej.' : '';
@@ -2677,6 +2690,102 @@ create trigger layervault_touch
         showToast(`„${ord.project}” wydano już na innym urządzeniu – drugie wydanie cofnięto, filament wrócił na stan.`, 8000);
     }
 
+    /* ---------- Zlecenie zmieniane na dwóch urządzeniach między synchronizacjami ----------
+       Wcześniej wygrywała ostatnia zmiana CAŁEGO zlecenia: płyta uruchomiona na telefonie znikała, gdy na Macu
+       (który nie pobrał jeszcze tej zmiany) ktoś przypisał drukarkę albo dopisał notatkę. Teraz każde zlecenie pamięta:
+         vh    – znaczniki swoich wcześniejszych wersji (widać, czy jedna wersja powstała z drugiej),
+         _base   – ostatnią wersję wspólną z chmurą sprzed własnych zmian,
+         _pushed – ostatnio wysłaną wersję (obie tylko na urządzeniu, nie trafiają do chmury ani kopii).
+       Wspólny przodek przy łączeniu = najnowsza z nich, którą wersja z chmury ma w swojej historii.
+       Zmiany równoległe łączą się pole po polu względem _base; każda płyta (etap) osobno. */
+    function orderContent(o) { const { _syncedTs, _base, _pushed, ...rest } = o; return rest; }
+    async function trackOrderLineage(item) {
+        let stored = null;
+        try { stored = await idbGetOne('orders', item.id); } catch (_) { /* bez bazy danych: zostaje zwykłe „ostatnia zmiana wygrywa” */ }
+        if (!stored) { delete item._base; delete item._pushed; return; }   // nowe zlecenie
+        const prevTs = Number(stored.updated_at) || 0;
+        if (!prevTs) return;
+        item.vh = [...new Set([...(Array.isArray(stored.vh) ? stored.vh : []).map(Number), prevTs])].slice(-40);
+        if (stored._syncedTs === prevTs) item._base = orderContent(stored);   // poprzednia wersja jest w chmurze
+        else if (stored._base) item._base = stored._base;                     // ta sama seria niewysłanych zmian
+        else delete item._base;
+        if (stored._pushed) item._pushed = stored._pushed; else delete item._pushed;   // ostatnio wysłana wersja (patrz pushLocalChanges)
+        // ft = kiedy ostatnio zmieniono każde pole (płyty: każda osobno) – rozstrzyga, gdy to samo pole zmieniono na obu urządzeniach
+        const ft = { ...(stored.ft || {}) };
+        const now = nextStamp();
+        for (const k of new Set([...Object.keys(stored), ...Object.keys(item)])) {
+            if (ORDER_MERGE_SKIP.has(k)) continue;
+            if (k === 'stageState') {
+                const a = stored.stageState || {}, b = item.stageState || {};
+                for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) if (!sameJson(a[key], b[key])) ft[`stage:${key}`] = now;
+            } else if (!sameJson(item[k], stored[k])) ft[k] = now;
+        }
+        item.ft = ft;
+    }
+    // Pola wynikające z pozycji zlecenia – zawsze brane razem z jednej strony (inaczej sumy nie zgadzałyby się z pozycjami)
+    const ORDER_CONTENT_FIELDS = ['items', 'price', 'cost', 'weight', 'hours', 'qty', 'allocations', 'accessories', 'finishing', 'laborMinutes',
+        'project', 'titleCustom', 'url', 'staged', 'stageSplit', 'priceAdjust'];
+    // Rozliczenie – jedna całość; zlecenie rozliczone jest zamrożone (pozycje, status i etapy z tej samej strony)
+    const ORDER_BOOKING_FIELDS = ['booked', 'bookedAt', 'paid', 'payMethod', 'paidAt', 'deducted', 'deductedAcc', 'hoursAdded', 'hoursPrinterId', 'hoursSplit', 'supersedes'];
+    const ORDER_FROZEN_WITH_BOOKING = ['status', 'printStartedAt', 'printedAt', 'printerId', 'stageState'];
+    const ORDER_MERGE_SKIP = new Set(['id', 'updated_at', 'created_at', 'vh', 'ft', '_syncedTs', '_base', '_pushed']);
+    function sameJson(a, b) { return JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b); }
+    function mergeStageStates(base, local, remote, localFirst) {
+        const b = base || {}, l = local || {}, r = remote || {};
+        const rank = { printing: 1, done: 2 };
+        const out = {};
+        for (const key of new Set([...Object.keys(b), ...Object.keys(l), ...Object.keys(r)])) {
+            const eb = b[key] || {}, el = l[key] || {}, er = r[key] || {};
+            const e = {};
+            for (const f of new Set([...Object.keys(eb), ...Object.keys(el), ...Object.keys(er)])) {
+                const lc = !sameJson(el[f], eb[f]), rc = !sameJson(er[f], eb[f]);
+                let v;
+                if (lc && rc) v = f === 'status' ? ((rank[el[f]] || 0) >= (rank[er[f]] || 0) ? el[f] : er[f]) : (localFirst(`stage:${key}`) ? el[f] : er[f]);   // dalej posunięty etap wygrywa
+                else v = rc ? er[f] : el[f];
+                if (v !== undefined && v !== null && v !== '') e[f] = v;
+            }
+            if (Object.keys(e).length) out[key] = e;
+        }
+        return Object.keys(out).length ? out : undefined;
+    }
+    function mergeListById(base, local, remote) {
+        if (!Array.isArray(local) && !Array.isArray(remote)) return undefined;
+        const B = new Set((base || []).map((x) => x && x.id)), L = new Set((local || []).map((x) => x && x.id)), R = new Set((remote || []).map((x) => x && x.id));
+        const out = (local || []).filter((x) => !(B.has(x.id) && !R.has(x.id)));             // usunięte po drugiej stronie
+        for (const x of remote || []) if (!L.has(x.id) && !B.has(x.id)) out.push(x);         // dodane po drugiej stronie
+        return out;
+    }
+    function mergeOrderRecords(base, local, remote, lTs, remoteTs) {
+        const localNewer = lTs >= remoteTs;
+        // To samo pole zmienione po obu stronach → wygrywa późniejsza zmiana TEGO pola (ft); bez ft – nowszy rekord
+        const tOf = (side, keys) => Math.max(0, ...keys.map((k) => Number((side.ft || {})[k]) || 0));
+        const localFirst = (...keys) => { const a = tOf(local, keys), b = tOf(remote, keys); return a === b ? localNewer : a > b; };
+        const changed = (side, fields) => fields.some((k) => !sameJson(side[k], base[k]));
+        const lBook = changed(local, ORDER_BOOKING_FIELDS), rBook = changed(remote, ORDER_BOOKING_FIELDS);
+        const bookSide = lBook && rBook ? (localFirst(...ORDER_BOOKING_FIELDS) ? local : remote) : rBook ? remote : lBook ? local : null;
+        const lCont = changed(local, ORDER_CONTENT_FIELDS), rCont = changed(remote, ORDER_CONTENT_FIELDS);
+        const contentSide = bookSide || (lCont && rCont ? (localFirst(...ORDER_CONTENT_FIELDS) ? local : remote) : rCont ? remote : local);
+        const merged = { ...local };
+        const put = (k, v) => { if (v === undefined) delete merged[k]; else merged[k] = v; };
+        for (const k of new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])) {
+            if (ORDER_MERGE_SKIP.has(k)) continue;
+            if (ORDER_BOOKING_FIELDS.includes(k)) { if (bookSide) put(k, bookSide[k]); continue; }
+            if (bookSide && ORDER_FROZEN_WITH_BOOKING.includes(k)) { put(k, bookSide[k]); continue; }
+            if (ORDER_CONTENT_FIELDS.includes(k)) { put(k, contentSide[k]); continue; }
+            if (k === 'stageState') { put(k, mergeStageStates(base[k], local[k], remote[k], localFirst)); continue; }
+            if (k === 'failures') { put(k, mergeListById(base[k], local[k], remote[k])); continue; }
+            const lc = !sameJson(local[k], base[k]), rc = !sameJson(remote[k], base[k]);
+            put(k, lc && rc ? (localFirst(k) ? local : remote)[k] : rc ? remote[k] : local[k]);
+        }
+        const ft = { ...(remote.ft || {}) };
+        for (const [k, t] of Object.entries(local.ft || {})) ft[k] = Math.max(Number(ft[k]) || 0, Number(t) || 0);
+        if (Object.keys(ft).length) merged.ft = ft; else delete merged.ft;
+        // Status zlecenia z płytami wynika z płyt (po połączeniu: np. jedna w druku, druga z przypisaną drukarką)
+        if (!bookSide && merged.staged) { pruneStages(merged); syncOrderFromStages(merged); }
+        delete merged._syncedTs; delete merged._base; delete merged._pushed;
+        return merged;
+    }
+
     // Stosuje stronę zmian z chmury: decyzje na mapach (O(n) zamiast O(n²)), zapis jedną transakcją na magazyn.
     // _syncedTs oznacza wersję pochodzącą z chmury → nie jest odsyłana z powrotem (wcześniej „echo” przy każdej synchronizacji).
     async function applyRemotePage(rows) {
@@ -2684,7 +2793,7 @@ create trigger layervault_touch
         const getMap = (s) => maps[s] || (maps[s] = new Map(state[s].map((x) => [x.id, x])));
         const tombs = new Map(state.tombstones.map((t) => [t.id, t]));
         const puts = {}, dels = {}, tombPuts = new Map(), tombDels = new Set();
-        const marks = {}, keepOrders = [], dupBookings = [], pageIncome = new Map();
+        const marks = {}, keepOrders = [], dupBookings = [], pageIncome = new Map(), mergedOrders = [];
         const lastPush = Number(safeStorage.get('lv_sync_push_ts', 0)) || 0;
         let applied = 0;
         for (const row of rows) if (row && row.store === 'finance' && !row.deleted && typeof row.id === 'string') pageIncome.set(row.id, { ...(row.data || {}), id: row.id });
@@ -2739,6 +2848,40 @@ create trigger layervault_touch
                         if (unpushed && lb < rb) { keepOrders.push({ id: local.id, supersedes: rb }); continue; }
                     }
                 }
+                if (row.store === 'orders') {
+                    const vhOf = (x) => (Array.isArray(x.vh) ? x.vh.map(Number) : []);
+                    const rvh = vhOf(rem), lvh = vhOf(local);
+                    const mark = () => { const l = marks.orders || (marks.orders = []); if (!l.includes(local)) l.push(local); };
+                    if (remoteTs === lTs) {
+                        // Nasza wersja wróciła z chmury → potwierdzona. _base zostaje do następnej zmiany: inne urządzenie
+                        // mogło wysłać wersję sprzed naszej zmiany chwilę po tym potwierdzeniu.
+                        if (local._syncedTs !== lTs) { local._syncedTs = lTs; mark(); }
+                        continue;
+                    }
+                    if (lvh.includes(remoteTs)) {
+                        // Nasza wersja powstała z tej z chmury → zostaje; chmura to nowy wspólny punkt odniesienia
+                        if (local._syncedTs !== lTs && !(local._base && Number(local._base.updated_at) >= remoteTs)) { local._base = { ...rem, updated_at: remoteTs }; mark(); }
+                        continue;
+                    }
+                    if (!rvh.includes(lTs)) {
+                        // Zmiany równoległe: żadna wersja nie zawiera drugiej → łączenie względem wspólnej wersji
+                        const base = [local._pushed, local._base]
+                            .filter((c) => c && rvh.includes(Number(c.updated_at)))
+                            .sort((x, y) => Number(y.updated_at) - Number(x.updated_at))[0] || null;
+                        if (base) {
+                            const merged = mergeOrderRecords(base, local, rem, lTs, remoteTs);
+                            merged.vh = [...new Set([...lvh, ...rvh, lTs, remoteTs])].sort((x, y) => x - y).slice(-40);
+                            merged.updated_at = nextStamp();   // nowsza od obu → trafi do chmury i na drugie urządzenie
+                            merged._base = { ...rem, updated_at: remoteTs };
+                            m.set(row.id, merged);
+                            (puts.orders || (puts.orders = new Map())).set(row.id, merged);
+                            if (dels.orders) dels.orders.delete(row.id);
+                            mergedOrders.push(merged);
+                            applied++;
+                            continue;
+                        }
+                    }
+                }
             }
             if (row.deleted) {
                 if (local && (local.updated_at || 0) > remoteTs) continue;   // lokalna edycja nowsza niż usunięcie
@@ -2787,6 +2930,11 @@ create trigger layervault_touch
         if (puts.settings && puts.settings.size) applySettingRecords([...puts.settings.keys()]);
         for (const k of keepOrders) { const cur = getOrder(k.id); if (cur) { const { _syncedTs, ...o } = cur; await saveRecord('orders', { ...o, supersedes: k.supersedes }); applied++; } }
         for (const d of dupBookings) { await revertDuplicateBooking(d.mine, d.theirs, d.income); applied++; }
+        if (mergedOrders.length) {
+            const names = mergedOrders.map((o) => `„${o.project || 'zlecenie'}”`).join(', ');
+            syncMergeNote = ` Połączono zmiany z dwóch urządzeń: ${names}.`;
+            showToast(`Połączono zmiany z innego urządzenia: ${names}.`, 6000);
+        }
         return applied;
     }
 
@@ -2825,9 +2973,12 @@ create trigger layervault_touch
         // Wysłana wersja liczników = punkt odniesienia, gdy wróci do nas połączona z innym urządzeniem
         const pushedMarks = {};
         for (const r of rows) {
-            if (r.deleted || !COUNTERS[r.store]) continue;
+            if (r.deleted || !(COUNTERS[r.store] || r.store === 'orders')) continue;
             const it = state[r.store].find((x) => x.id === r.id);
-            if (it && Number(it.updated_at) === Number(r.updated_at)) { it._pushed = counterBase(r.store, it, r.updated_at); (pushedMarks[r.store] || (pushedMarks[r.store] = [])).push(it); }
+            if (it && Number(it.updated_at) === Number(r.updated_at)) {
+                it._pushed = r.store === 'orders' ? orderContent(it) : counterBase(r.store, it, r.updated_at);
+                (pushedMarks[r.store] || (pushedMarks[r.store] = [])).push(it);
+            }
         }
         for (const [st, list] of Object.entries(pushedMarks)) await idbPutMany(st, list, { keepTs: true });
         safeStorage.set('lv_sync_push_ts', String(startedAt));
@@ -11161,6 +11312,11 @@ create trigger layervault_touch
         window.addEventListener('popstate', onPopState);
         window.addEventListener('hashchange', onHashChange);
         window.addEventListener('online', () => scheduleSync(1000));
+        // Aplikacja otwarta bez przerwy (np. na Macu) sama pobiera zmiany z innych urządzeń: co minutę i po powrocie do okna
+        setInterval(() => {
+            if (document.visibilityState === 'visible' && supabaseClient && navigator.onLine !== false && !syncInProgress) void syncWithSupabase(false);
+        }, SYNC_POLL_MS);
+        window.addEventListener('focus', () => scheduleSync(800));
         // Szkic wyceny zapisuje się też przy zamykaniu karty / przejściu aplikacji w tło
         window.addEventListener('pagehide', () => { saveDraftNow(); flushPendingSettings(); });
         document.addEventListener('visibilitychange', () => {
