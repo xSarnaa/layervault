@@ -250,6 +250,7 @@
                 <span class="text-sm text-slate-300">Zostało filamentu:</span>
                 <span id="tareNetResult" class="text-lg font-black text-indigo-400">0 g</span>
             </div>
+            <p id="tarePendingNote" class="hidden text-xs text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 break-words" aria-live="polite"></p>
             <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold min-h-12 rounded-xl text-sm">Zapisz wagę</button>
         </form>
     </div>
@@ -2176,6 +2177,96 @@
         }
         return map;
     }
+    // Rezerwacje widziane z kalkulatora: przy zmianie pozycji zlecenia jej własna rezerwacja nie jest „cudza”
+    // (wcześniej kalkulator ostrzegał, że zabraknie filamentu, który ta sama pozycja już miała zarezerwowany).
+    function calcReservedGrams() {
+        const map = reservedGramsBySpool();
+        const info = calcTargetInfo();
+        if (info && info.item) for (const a of info.item.allocations || []) {
+            const g = Number(a.grams) || 0;
+            if (g > 0 && map.has(a.spoolId)) map.set(a.spoolId, Math.max(0, round1(map.get(a.spoolId) - g)));
+        }
+        return map;
+    }
+    function calcReservedAccessories() {
+        const map = reservedAccessoriesById();
+        const info = calcTargetInfo();
+        if (info && info.item) for (const a of info.item.accessories || []) {
+            const q = Number(a.qty) || 0;
+            if (q > 0 && map.has(a.accId)) map.set(a.accId, Math.max(0, map.get(a.accId) - q));
+        }
+        return map;
+    }
+    // Wydrukowane części zlecenia: [{ spoolId, grams, at }]; „at” = kiedy wydruk się skończył (0 = nie wiadomo)
+    function printedChunks(o) {
+        const out = [];
+        const ready = o.status === 'Gotowe do odbioru' || o.status === 'Wydane';
+        if (isStagedOrder(o)) {
+            for (const st of orderStages(o, true)) {
+                if (!(ready || st.status === 'done')) continue;
+                const at = Number(st.doneAt) || Number(o.printedAt) || 0;
+                for (const f of st.fil) if (Number(f.grams) > 0) out.push({ spoolId: f.spoolId, grams: Number(f.grams), at });
+            }
+        } else if (ready) {
+            for (const al of o.allocations || []) if (Number(al.grams) > 0) out.push({ spoolId: al.spoolId, grams: Number(al.grams), at: Number(o.printedAt) || 0 });
+        }
+        return out;
+    }
+    function orderAllocMap(o) {
+        const m = new Map();
+        for (const al of o.allocations || []) { const g = Number(al.grams) || 0; if (g > 0) m.set(al.spoolId, (m.get(al.spoolId) || 0) + g); }
+        return m;
+    }
+    // Szpula zważona (albo stan wpisany ręcznie) PO zakończeniu wydruku → zużycie tego wydruku jest już w stanie szpuli.
+    // Zwraca Map: id szpuli → gramy zlecenia, których „Wydaj i rozlicz” nie odejmuje drugi raz.
+    function weighCoveredGrams(o) {
+        const alloc = orderAllocMap(o), cov = new Map(), all = new Map();
+        for (const c of printedChunks(o)) {
+            const sp = getSpool(c.spoolId);
+            if (!sp) continue;
+            all.set(c.spoolId, (all.get(c.spoolId) || 0) + c.grams);
+            if (c.at > 0 && (Number(sp.weighedAt) || 0) > c.at) cov.set(c.spoolId, (cov.get(c.spoolId) || 0) + c.grams);
+        }
+        const ready = o.status === 'Gotowe do odbioru' || o.status === 'Wydane';
+        const out = new Map();
+        cov.forEach((g, id) => {
+            const al = alloc.get(id) || 0;
+            const whole = ready && Math.abs((all.get(id) || 0) - g) < 0.05;   // wszystko z tej szpuli wydrukowane przed ważeniem
+            const v = round1(whole ? al : Math.min(al, g));
+            if (v > 0) out.set(id, v);
+        });
+        return out;
+    }
+    // Filament już wydrukowany, którego nie ma jeszcze w stanie szpuli: odejmie go dopiero „Wydaj i rozlicz”
+    // (wydruki zakończone po ostatnim ważeniu). Zwraca Map: id szpuli → { grams, orders: [{ o, grams }] }.
+    function printedUnbookedBySpool() {
+        const map = new Map();
+        for (const o of state.orders) {
+            if (o.booked) continue;
+            const alloc = orderAllocMap(o);
+            if (!alloc.size) continue;
+            const printed = new Map(), untimed = new Map();
+            for (const c of printedChunks(o)) {
+                printed.set(c.spoolId, (printed.get(c.spoolId) || 0) + c.grams);
+                if (!(c.at > 0)) untimed.set(c.spoolId, (untimed.get(c.spoolId) || 0) + c.grams);
+            }
+            const covered = weighCoveredGrams(o);
+            const ready = o.status === 'Gotowe do odbioru' || o.status === 'Wydane';
+            printed.forEach((g, id) => {
+                if (!getSpool(id)) return;
+                const open = round1(Math.min(ready ? (alloc.get(id) || 0) : g, alloc.get(id) || 0) - (covered.get(id) || 0));
+                if (!(open > 0)) return;
+                // timed = wydruki o znanym czasie zakończenia: tylko je ważenie „teraz” zamknie (starsze zlecenia bez czasu – nie)
+                const timed = round1(Math.max(0, open - Math.min(open, untimed.get(id) || 0)));
+                const e = map.get(id) || { grams: 0, timed: 0, orders: [] };
+                e.grams = round1(e.grams + open);
+                e.timed = round1(e.timed + timed);
+                e.orders.push({ o, grams: open, timed });
+                map.set(id, e);
+            });
+        }
+        return map;
+    }
     function inventoryValue() {
         const fil = state.spools.reduce((a, s) => a + (Math.max(0, Number(s.grams) || 0) / 1000) * (Number(s.price) || 0), 0);
         const acc = state.accessories.reduce((a, x) => a + (Number(x.price) || 0) * Math.max(0, Number(x.stock) || 0), 0);
@@ -2531,6 +2622,8 @@ create trigger layervault_touch
             // Etykieta wydrukowana na jednym urządzeniu zostaje zapamiętana (najnowszy wydruk z obu stron)
             const lab = [local, remote].filter((x) => x.labelCode && Number(x.labelAt) > 0).sort((a, b) => Number(b.labelAt) - Number(a.labelAt))[0];
             if (lab) { merged.labelCode = lab.labelCode; merged.labelAt = lab.labelAt; }
+            const wAt = Math.max(Number(local.weighedAt) || 0, Number(remote.weighedAt) || 0);
+            if (wAt > 0) merged.weighedAt = wAt;
         }
         delete merged._base; delete merged._pushed; delete merged._syncedTs;
         return merged;
@@ -3349,7 +3442,7 @@ create trigger layervault_touch
         return out;
     }
     function spoolPickerOptionsHtml() {
-        const reserved = reservedGramsBySpool();
+        const reserved = calcReservedGrams();
         const byNo = compareSpoolCodes;
         const byColor = (a, b) => String(a.color || '').localeCompare(String(b.color || ''), 'pl')
             || String(a.brand || '').localeCompare(String(b.brand || ''), 'pl') || byNo(a, b);
@@ -3383,7 +3476,7 @@ create trigger layervault_touch
     // ⚠ przy szpulach, na których zabraknie filamentu na bieżący wydruk (bez zmiany kolejności listy)
     function markSpoolNeeds(sel, needed) {
         if (!sel) return;
-        const reserved = reservedGramsBySpool();
+        const reserved = calcReservedGrams();
         for (const o of sel.options) {
             if (!o.value || !o.dataset.label) continue;
             const sp = getSpool(o.value);
@@ -3427,7 +3520,7 @@ create trigger layervault_touch
 
     function refreshCalcAccessorySelect() {
         const sel = $('calcAccSelect');
-        const reserved = reservedAccessoriesById();
+        const reserved = calcReservedAccessories();
         const list = regularAccessories().sort((a, b) => String(a.name).localeCompare(String(b.name), 'pl'));
         fillSelect(sel, `<option value="">${list.length ? '— wybierz akcesorium —' : 'Brak akcesoriów w magazynie'}</option>` +
             list.map((a) => {
@@ -3954,7 +4047,7 @@ create trigger layervault_touch
         const profit = finalTotal - tkw;   // może być ujemny – strata jest pokazywana
 
         const allocations = [...allocMap.values()].map((a) => ({ ...a, grams: round1(a.grams) }));
-        const reserved = reservedGramsBySpool();
+        const reserved = calcReservedGrams();
         allocations.forEach((a) => {
             const sp = getSpool(a.spoolId);
             if (!sp) return;
@@ -3965,7 +4058,7 @@ create trigger layervault_touch
             else if (free < a.grams) notes.push(`${spoolLabel(sp)}: po zleceniach w kolejce (${fmtG(reserved.get(sp.id))}) zabraknie ${fmtG(a.grams - free)}.`);
         });
         const accessories = [...accMap.values()];
-        const accReserved = reservedAccessoriesById();
+        const accReserved = calcReservedAccessories();
         accessories.forEach((m) => {
             const a = getAccessory(m.accId);
             const have = Number(a.stock) || 0;
@@ -4296,13 +4389,21 @@ create trigger layervault_touch
 
         let density = DEFAULT_DENSITY;
         let totalG = 0, perG = [], perCm3 = [], perMm = [], curaM = [], timeTotal = 0, timeNormal = 0, timeOther = 0;
+        let bambuG = [], bambuIds = [];   // Bambu Studio: gramy każdego UŻYTEGO filamentu + ich numery („; filament: 1,3”)
         let fTypes = [], fColors = [], fNames = [];
         const splitList = (v) => String(v).split(';').map((x) => x.trim().replace(/^"|"$/g, ''));
         const lines = text.split(/\r?\n/);
         for (const line of lines) {
             if (line.charCodeAt(0) !== 59) continue; // tylko komentarze ';'
             let m;
-            if ((m = /^;\s*total filament (?:weight|used) \[g\]\s*[:=]\s*([\d.]+)/i.exec(line))) totalG = parseFloat(m[1]) || totalG;
+            // Bambu Studio przy kilku filamentach zapisuje tu listę po przecinku („: 7.01,6.97,4.71”), po jednej wartości
+            // na użyty filament – wcześniej brana była tylko pierwsza liczba i wycena wychodziła za niska.
+            if ((m = /^;\s*total filament (?:weight|used) \[g\]\s*[:=]\s*(.+)$/i.exec(line))) {
+                const list = parseNumList(m[1]);
+                if (/weight/i.test(line) && list.length) bambuG = list;
+                totalG = list.reduce((a, b) => a + b, 0) || totalG;
+            }
+            else if ((m = /^;\s*filament:\s*([\d,\s]+)$/i.exec(line))) bambuIds = parseNumList(m[1]).map((n) => Math.floor(n)).filter((n) => n >= 1);
             else if ((m = /^;\s*filament used \[g\]\s*[:=]\s*(.+)$/i.exec(line))) perG = parseNumList(m[1]);
             else if ((m = /^;\s*filament used \[cm3\]\s*[:=]\s*(.+)$/i.exec(line))) perCm3 = parseNumList(m[1]);
             else if ((m = /^;\s*filament used \[mm\]\s*[:=]\s*(.+)$/i.exec(line))) perMm = parseNumList(m[1]);
@@ -4328,6 +4429,14 @@ create trigger layervault_touch
             curaM.map((v) => mmToGrams(v * 1000, density))
         ];
         out.perExtruder = candidates.find((c) => sum(c) > 0) || [];
+        if (!out.perExtruder.length && sum(bambuG) > 0 && (bambuG.length > 1 || bambuIds.length === 1)) {
+            // Numery użytych filamentów znane → filament nr N trafia do wiersza N; inaczej po kolei od pierwszego
+            const ids = bambuIds.length === bambuG.length ? bambuIds : bambuG.map((_, i) => i + 1);
+            const per = [];
+            bambuG.forEach((g, i) => { per[ids[i] - 1] = (per[ids[i] - 1] || 0) + g; });
+            out.perExtruder = Array.from(per, (g) => g || 0);
+            if (bambuIds.length !== bambuG.length && bambuG.length > 1) out.filamentOrderGuessed = true;
+        }
         out.grams = totalG || sum(out.perExtruder);
         out.seconds = timeTotal || timeNormal || timeOther;
         const nFil = Math.max(fTypes.length, fColors.length, fNames.length);
@@ -4485,7 +4594,7 @@ create trigger layervault_touch
     }
     function suggestSpool(fil, needGrams, avoidIds) {
         if (!fil || (!fil.type && !fil.color)) return null;
-        const reserved = reservedGramsBySpool();
+        const reserved = calcReservedGrams();
         const wantShade = fil.color ? shadeFromHex(fil.color) : null;
         const name = foldPl(fil.name || '');
         const fileType = normType(fil.type);
@@ -4565,6 +4674,7 @@ create trigger layervault_touch
                 else matches.push(`#${slot} → brak pasującej szpuli (${filamentLabel(fil)}) – wybierz ręcznie`);
             });
             modeInfo = ` Wykryto ${nonZero.length} ${plural(nonZero.length, 'filament', 'filamenty', 'filamentów')}: ${used.join(', ')}.`;
+            if (info.filamentOrderGuessed) modeInfo += ' Plik nie podaje numerów filamentów – wpisałem je po kolei, sprawdź szpule.';
             if (matches.length) { matchInfo = `Dobrane szpule (sprawdź):\n${matches.join('\n')}`; rememberSpoolUse(picked); }
             else if (!fils.length) modeInfo += ' Wybierz szpule dla filamentów.';
         } else if (info.grams > 0) {
@@ -5471,11 +5581,21 @@ create trigger layervault_touch
             }
             const allocs = (ord.allocations || []).filter((a) => Number(a.grams) > 0);
             const lines = [];
+            // Szpula zważona po wydruku → tych gramów nie odejmujemy drugi raz (stan z wagi już je uwzględnia)
+            const covLeft = weighCoveredGrams(ord);
+            const useBy = new Map();   // pozycja przydziału → gramy do odjęcia teraz
+            allocs.forEach((a) => {
+                const c = Math.min(Number(a.grams) || 0, covLeft.get(a.spoolId) || 0);
+                if (c > 0) covLeft.set(a.spoolId, round1((covLeft.get(a.spoolId) || 0) - c));
+                useBy.set(a, Math.max(0, round1(a.grams - c)));
+            });
             allocs.forEach((a) => {
                 const sp = getSpool(a.spoolId);
+                const use = useBy.get(a), cov = round1(a.grams - use);
+                const covTxt = cov > 0 ? ` (${fmtG(cov)} już w stanie – szpula ważona po wydruku)` : '';
                 if (!sp) lines.push(`⚠ Szpula usunięta – pominięto ${fmtG(a.grams)}`);
-                else if ((Number(sp.grams) || 0) < a.grams) lines.push(`⚠ ${spoolLabel(sp)}: potrzeba ${fmtG(a.grams)}, jest ${fmtG(sp.grams)} – stan zostanie wyzerowany`);
-                else lines.push(`– ${spoolLabel(sp)}: −${fmtG(a.grams)}`);
+                else if ((Number(sp.grams) || 0) < use) lines.push(`⚠ ${spoolLabel(sp)}: potrzeba ${fmtG(use)}, jest ${fmtG(sp.grams)} – stan zostanie wyzerowany${covTxt}`);
+                else lines.push(`– ${spoolLabel(sp)}: −${fmtG(use)}${covTxt}`);
             });
             const accs = (ord.accessories || []).filter((a) => Number(a.qty) > 0);
             const accLinesTxt = accs.map((a) => {
@@ -5513,7 +5633,7 @@ create trigger layervault_touch
                 if (!sp) continue;
                 if (canDeduct) {
                     const before = Number(sp.grams) || 0;
-                    sp.grams = Math.max(0, round1(before - a.grams));
+                    sp.grams = Math.max(0, round1(before - (useBy.has(a) ? useBy.get(a) : a.grams)));
                     deducted.push({ spoolId: sp.id, grams: round1(before - sp.grams) });
                     await saveRecord('spools', sp);
                 }
@@ -5593,8 +5713,11 @@ create trigger layervault_touch
         const dedAcc = Array.isArray(ord.deductedAcc) ? ord.deductedAcc.filter((d) => Number(d.qty) > 0) : [];
         dedAcc.forEach((d) => lines.push(`• +${d.qty} szt. → ${(getAccessory(d.accId) || {}).name || 'usunięte akcesorium (pominięto)'}`));
         hrs.forEach((h) => lines.push(`• −${fmtH(h.hours)} z licznika ${getPrinter(h.printerId).name}`));
-        const incomes = state.finance.filter((f) => f.orderId === ord.id);
+        // Tylko przychód: wpisy „Nieudany wydruk” tego zlecenia zostają (strata się wydarzyła, filament i godziny już odjęte)
+        const incomes = state.finance.filter((f) => f.orderId === ord.id && f.type === 'income');
         lines.push(`• usunięcie ${incomes.length} ${plural(incomes.length, 'wpisu', 'wpisów', 'wpisów')} przychodu`);
+        const failsKept = state.finance.filter((f) => f.orderId === ord.id && f.category === 'failed').length;
+        if (failsKept) lines.push(`• ${plural(failsKept, 'wpis', 'wpisy', 'wpisów')} „Nieudany wydruk” (${failsKept}) ${plural(failsKept, 'zostaje', 'zostają', 'zostaje')} w finansach`);
         if (!(await appConfirm(`„${ord.project}” (${ord.customer})\n${lines.join('\n')}`, { title: 'Cofnąć rozliczenie?', okText: 'Cofnij rozliczenie', danger: true }))) return;
 
         for (const d of ded || []) {
@@ -6077,6 +6200,7 @@ create trigger layervault_touch
         calcTarget = t && t.orderId ? t : null;
         if (calcTarget) safeStorage.setJSON('lv_calc_target', calcTarget); else safeStorage.del('lv_calc_target');
         renderCalcTarget();
+        refreshCalculatorPickers();   // „wolne” gramy na listach zależą od tego, czy edytowana jest pozycja zlecenia
     }
     function calcTargetInfo() {
         if (!calcTarget) return null;
@@ -6877,7 +7001,8 @@ create trigger layervault_touch
             if (was !== 'W druku' || !ord.printStartedAt) ord.printStartedAt = now;
             if (!getPrinter(ord.printerId) && state.printers.length === 1) ord.printerId = state.printers[0].id;
         } else {
-            if (was === 'W druku' && status === 'Gotowe do odbioru') ord.printedAt = now;
+            // Koniec wydruku: z „W druku” zawsze teraz; przy przeskoku prosto do „Gotowe” zostaje wcześniejszy czas, jeśli był
+            if (status === 'Gotowe do odbioru' && was !== 'Gotowe do odbioru') ord.printedAt = was === 'W druku' ? now : (Number(ord.printedAt) || now);
             delete ord.printStartedAt;
         }
         return ord;
@@ -9074,7 +9199,7 @@ create trigger layervault_touch
         if (!wantMounted) delete sp.mountedAt;
         const emptyDelta = wantMounted && !wasMounted ? -1 : !wantMounted && wasMounted ? 1 : 0;
         if (pendingEAN) sp.ean = pendingEAN;
-        if (existing && Number(existing.grams) !== Number(sp.grams)) markCounterSet(sp, 'grams');
+        if (existing && Number(existing.grams) !== Number(sp.grams)) { markCounterSet(sp, 'grams'); sp.weighedAt = Date.now(); }
 
         const amount = !existing && $('spoolAutoExpense').checked ? round2((price * net) / 1000) : 0;
         if (amount > 0) sp.expensed = true;
@@ -9268,8 +9393,10 @@ create trigger layervault_touch
         }
         if (list.length === 0) { container.innerHTML = '<p class="text-sm text-slate-400">Brak szpul pasujących do filtrów.</p>'; return; }
         const btn = 'min-h-12 min-w-0 rounded-xl text-[11px] tracking-tight min-[360px]:text-xs min-[360px]:tracking-normal font-semibold flex flex-col items-center justify-center gap-0.5 disabled:opacity-40';
+        const pendingMap = printedUnbookedBySpool();
         container.innerHTML = list.map((s) => {
             const grams = Math.max(0, Number(s.grams) || 0);
+            const pending = Math.min(grams, (pendingMap.get(s.id) || {}).grams || 0);
             const initial = Math.max(grams, Number(s.initialGrams) || grams || 1);
             const pct = Math.min(100, Math.round((grams / initial) * 100));
             const low = isLowStock(s);
@@ -9289,6 +9416,7 @@ create trigger layervault_touch
                         <div class="text-right shrink-0">
                             <div class="text-sm font-bold tabular-nums ${grams <= 0 ? 'text-rose-400' : low ? 'text-amber-300' : 'text-slate-100'}">${fmtG(grams)}</div>
                             <div class="text-xs text-slate-400">${grams <= 0 ? 'pusta' : low ? 'kończy się' : `z ${fmtG(initial)}`}</div>
+                            ${pending > 0 ? `<div class="text-[11px] text-amber-300" data-pending title="Wydrukowane zlecenia, które czekają na „Wydaj i rozlicz”">w tym ${fmtG(pending)} do rozliczenia</div>` : ''}
                         </div>
                     </div>
                     <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden" role="img" aria-label="Pozostało ${pct}%">
@@ -10086,10 +10214,24 @@ create trigger layervault_touch
         const v = $('tarePresetSelect').value;
         return v === 'custom' ? readNum('tareCustomInput', 0, 0) : (parseFloat(v) || 0);
     }
+    // Filament wydrukowany, a jeszcze nierozliczony: na wadze już go nie ma. Po ważeniu „Wydaj i rozlicz”
+    // nie odejmie go drugi raz (weighCoveredGrams) – okno tylko o tym informuje.
+    function tarePending() {
+        const e = tareSpoolId ? printedUnbookedBySpool().get(tareSpoolId) : null;
+        return e && e.timed > 0 ? { grams: e.timed, orders: e.orders.filter((x) => x.timed > 0).map((x) => ({ o: x.o, grams: x.timed })) } : null;
+    }
     function updateTarePreview() {
         const gross = readNum('tareGrossInput', 0, 0);
         const net = Math.max(0, Math.round(gross - getModalTare()));
         $('tareNetResult').textContent = fmtG(net);
+        const pend = tarePending();
+        const note = $('tarePendingNote');
+        note.classList.toggle('hidden', !pend);
+        if (pend) {
+            const names = pend.orders.map((x) => `„${x.o.project}” (${x.o.customer}) ${fmtG(x.grams)}`).join(', ');
+            note.textContent = `Z tej szpuli wydrukowano już zlecenia, które czekają na „Wydaj i rozlicz”: ${names}. `
+                + `Waga już to uwzględnia – przy rozliczeniu nie odejmę tych ${fmtG(pend.grams)} drugi raz.`;
+        }
         return net;
     }
     async function saveTareWeight() {
@@ -10102,21 +10244,26 @@ create trigger layervault_touch
         const net = Math.round(gross - tare);
         const before = Number(sp.grams) || 0;
         const beforeInitial = sp.initialGrams;
+        const pend = tarePending();
+        const beforeWeighedAt = sp.weighedAt;
         sp.grams = net;
         markCounterSet(sp, 'grams');
+        sp.weighedAt = Date.now();   // wydruki zakończone wcześniej są już w tym stanie
         if (net > (Number(sp.initialGrams) || 0)) sp.initialGrams = net;
         await saveRecord('spools', sp);
         // Refill zważony na szpuli (tara > 0) = założony na pustą szpulę
         const ref = sp.refill && !sp.mountedAt && tare > 0 ? await mountRefills([sp.id]) : null;
         closeTareModal();
         refreshAllViews();
-        showToast(`Zapisano: ${fmtG(net)} filamentu (było ${fmtG(before)}).${refillNote(ref)}`, ref ? 9000 : 7000, {
+        const pendTxt = pend ? ` Wydrukowanych zleceń (${fmtG(pend.grams)}) nie odejmę drugi raz przy rozliczeniu.` : '';
+        showToast(`Zapisano: ${fmtG(net)} filamentu (było ${fmtG(before)}).${pendTxt}${refillNote(ref)}`, ref || pend ? 9000 : 7000, {
             label: 'Cofnij',
             fn: async () => {
                 const cur = getSpool(sp.id);
                 if (!cur) return;
                 cur.grams = before;
                 markCounterSet(cur, 'grams');
+                if (beforeWeighedAt) cur.weighedAt = beforeWeighedAt; else delete cur.weighedAt;
                 cur.initialGrams = beforeInitial;
                 await saveRecord('spools', cur);
                 await unmountRefills(ref);
