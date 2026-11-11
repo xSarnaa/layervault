@@ -3087,6 +3087,22 @@ create trigger layervault_touch
                     </div>
                 </div>`);
         }
+        // Limit działalności nierejestrowanej: baner od 80% (limit był dotąd widoczny tylko w Finansach)
+        const ls = limitState();
+        if (ls && ls.pct >= 80 && safeStorage.get('lv_limit_banner_hide', '') !== limitBannerKey(ls)) {
+            const over = ls.pct >= 100;
+            parts.push(`
+                <div class="${over ? 'bg-rose-500/10 border-rose-500/40' : 'bg-amber-500/10 border-amber-500/40'} border rounded-2xl p-3 sm:p-4 flex flex-wrap items-center gap-x-4 gap-y-2" data-limit-banner="${over ? 'over' : 'near'}">
+                    <div class="min-w-0 flex-1 basis-56">
+                        <div class="text-sm font-bold ${over ? 'text-rose-300' : 'text-amber-300'} flex items-center gap-2">${icon('triangle-exclamation')} ${over ? 'Limit przychodu przekroczony' : `Limit przychodu: ${Math.round(ls.pct)}%`}</div>
+                        <p class="text-sm text-slate-300 mt-0.5">${ls.qt.label}: ${fmt(ls.rev)} z ${fmt(ls.lim)}${over ? '' : ` – zostało ${fmt(ls.left)}`} (działalność nierejestrowana).</p>
+                    </div>
+                    <div class="flex gap-2">
+                        <button type="button" data-act="limit-open" class="${over ? 'bg-rose-600 hover:bg-rose-500' : 'bg-amber-600 hover:bg-amber-500'} text-white font-bold min-h-11 px-4 rounded-xl text-sm">Zobacz w Finansach</button>
+                        <button type="button" data-act="limit-banner-hide" data-key="${limitBannerKey(ls)}" class="bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold min-h-11 px-4 rounded-xl text-sm">Ukryj</button>
+                    </div>
+                </div>`);
+        }
         box.innerHTML = parts.join('');
     }
     function snoozeBackupReminder() {
@@ -4723,7 +4739,9 @@ create trigger layervault_touch
         return [fil.type, fil.color].filter(Boolean).join(' ');
     }
     const normType = (t) => foldPl(t).replace(/[\s_\-]+/g, '');
-    function spoolShadeOf(sp) {
+    // Odcień do dopasowania szpuli do filamentu z pliku: null = nie wiadomo (wtedy decyduje kolor w hex).
+    // Osobna nazwa: wcześniej ta funkcja nazywała się jak spoolShadeOf wyżej i ją zastępowała – stąd numery „PT-null.01”.
+    function spoolShadeOrNull(sp) {
         return sp.shade !== undefined && sp.shade !== null && sp.shade !== '' ? Number(sp.shade) : guessShade(sp.color, sp.hex);
     }
     // Ten sam materiał? PLA/PETG/ABS-ASA/TPU po grupie, pozostałe (PA, PC, PVA…) tylko po nazwie
@@ -4741,7 +4759,7 @@ create trigger layervault_touch
         if (!sameMaterial(sp.type, fil.type)) return false;
         if (!fil.color) return true;
         const want = shadeFromHex(fil.color);
-        return (want !== null && spoolShadeOf(sp) === want) || hexDistance(fil.color, spoolHex(sp)) <= 45;
+        return (want !== null && spoolShadeOrNull(sp) === want) || hexDistance(fil.color, spoolHex(sp)) <= 45;
     }
     function suggestSpool(fil, needGrams, avoidIds) {
         if (!fil || (!fil.type && !fil.color)) return null;
@@ -4762,7 +4780,7 @@ create trigger layervault_touch
             if (name && brandWord.length >= 3 && name.includes(brandWord)) score += 10;
             if (fil.color) {
                 const dist = hexDistance(fil.color, spoolHex(sp));
-                const sameShade = wantShade !== null && spoolShadeOf(sp) === wantShade;
+                const sameShade = wantShade !== null && spoolShadeOrNull(sp) === wantShade;
                 if (!sameShade && dist > 90) continue;      // zupełnie inny kolor – nie proponuj
                 if (sameShade) score += 40;
                 score += Math.max(0, 40 - dist / 4);
@@ -5665,6 +5683,12 @@ create trigger layervault_touch
         }
         if (isStagedOrder(ord)) return setStagedOrderStatus(ord, status);
         const wasPrinting = ord.status === 'W druku';
+        // „W druku” z listy statusów: jak przycisk w Planie druku – pytanie o zajętą drukarkę, zapis szpul w AMS, „Cofnij”
+        if (status === 'W druku' && !wasPrinting && getPrinter(getPrinter(ord.printerId) ? ord.printerId : soloPrinterId())) {
+            await startPrint(id);
+            renderOrders();   // anulowane pytanie → lista wraca do poprzedniego statusu
+            return;
+        }
         applyPrintStatus(ord, status);
         await saveRecord('orders', ord);
         const ref = status === 'W druku' && !wasPrinting ? await mountRefills(orderSpoolIds(ord)) : null;
@@ -5766,6 +5790,22 @@ create trigger layervault_touch
             if (Math.abs(costAdj) >= 0.01) msg += `\nKoszt druku na tych drukarkach: ${signedPLN(costAdj)} względem wyceny`;
             const deposit = Math.max(0, Number(ord.deposit) || 0);
             if (deposit > 0) msg += `\n\nZaliczka ${fmt(deposit)} – do zapłaty przy odbiorze: ${fmt(Math.max(0, (Number(ord.price) || 0) - deposit))}`;
+            // Zlecenie z płytami, z których część nie jest wydrukowana: rozliczenie obejmuje całość
+            if (isStagedOrder(ord)) {
+                const sts = orderStages(ord, true);
+                const notDone = sts.filter((x) => x.status !== 'done');
+                const printing = notDone.filter((x) => x.status === 'printing').length;
+                if (notDone.length && (notDone.length < sts.length || printing)) {
+                    msg += `\n\n⚠ Nie wszystko jest wydrukowane: ${notDone.length} z ${sts.length} ${plural(sts.length, 'wydruku', 'wydruków', 'wydruków')} jeszcze ${plural(notDone.length, 'czeka', 'czekają', 'czeka')}${printing ? ` (w druku: ${printing})` : ''}. Rozliczenie odejmie filament i doliczy godziny za całe zlecenie.`;
+                }
+            }
+            // Limit działalności nierejestrowanej: informacja od 80%, ostrzeżenie przy przekroczeniu
+            const ls = limitState(Number(ord.price) || 0);
+            if (ls && ls.pct >= 80) {
+                msg += ls.after > ls.lim
+                    ? `\n\n⚠ Limit przychodu: po tym zleceniu ${fmt(ls.after)} w kwartale – o ${fmt(ls.after - ls.lim)} ponad limit ${fmt(ls.lim)} (działalność nierejestrowana).`
+                    : `\n\nLimit przychodu: po tym zleceniu ${fmt(ls.after)} z ${fmt(ls.lim)} (${Math.round(ls.pct)}%) – zostanie ${fmt(ls.left)} do końca kwartału.`;
+            }
             const lastPay = safeStorage.get('lv_last_pay', 'cash');
             const answer = await appForm({
                 title: 'Wydać i rozliczyć zlecenie?', message: msg, okText: 'Wydaj i rozlicz',
@@ -6275,7 +6315,22 @@ create trigger layervault_touch
         if (!ord.printerId) ord.printerId = (ord.items.find((it) => it.printerId) || {}).printerId || '';
         // Plik z kilkoma płytami → zlecenie etapowe (każda płyta osobno w planie i na liście AMS)
         if (before) { ord.staged = true; ord.stageState = { ...(before.stageState || {}) }; }
-        if (ord.staged) { pruneStages(ord); syncOrderFromStages(ord); }
+        if (ord.staged) {
+            pruneStages(ord);
+            const left = orderStages(ord, true);
+            if (left.length === 1) collapseSingleStage(ord, left[0]); else syncOrderFromStages(ord);
+        }
+        return ord;
+    }
+    // Został jeden wydruk: zlecenie przestaje być „z płytami”, a drukarka, start i koniec tej płyty przechodzą na zlecenie
+    // (wcześniej zlecenie zostawało „W druku” bez drukarki i plan pokazywał je w „Bez drukarki”).
+    function collapseSingleStage(ord, st, now = Date.now()) {
+        if (getPrinter(st.printerId)) ord.printerId = st.printerId;
+        if (st.status === 'printing') { ord.status = 'W druku'; ord.printStartedAt = Number(st.startedAt) || now; }
+        else if (st.status === 'done') { ord.status = 'Gotowe do odbioru'; ord.printedAt = Number(st.doneAt) || Number(ord.printedAt) || now; delete ord.printStartedAt; }
+        else { if (ord.status === 'W druku' || ord.status === 'Gotowe do odbioru') ord.status = 'W kolejce'; delete ord.printStartedAt; }
+        delete ord.staged; delete ord.stageState;
+        if (ord.stageSplit && !Object.keys(ord.stageSplit).length) delete ord.stageSplit;
         return ord;
     }
     function itemFromCalculator(c) {
@@ -6955,6 +7010,23 @@ create trigger layervault_touch
             </div>`;
     }
     // Start wydruku: drukarka zapamiętuje założone szpule (kolejna płyta pokaże tylko zmiany)
+    // Jedna szpula nie może być naraz w dwóch drukarkach: założona tutaj znika z zapamiętanego AMS pozostałych.
+    // Zwraca listę zmian do cofnięcia: [{ pid, prev }].
+    async function takeSpoolsFromOtherPrinters(pid, spoolIds) {
+        const ids = new Set((spoolIds || []).filter(Boolean));
+        const changed = [];
+        if (!ids.size) return changed;
+        for (const p of [...state.printers]) {
+            if (p.id === pid || !p.amsLoaded || typeof p.amsLoaded !== 'object') continue;
+            const next = {};
+            let ch = false;
+            Object.entries(p.amsLoaded).forEach(([n, id]) => { if (ids.has(id)) ch = true; else next[n] = id; });
+            if (!ch) continue;
+            changed.push({ pid: p.id, prev: { ...p.amsLoaded } });
+            await saveRecord('printers', { ...p, amsLoaded: next });
+        }
+        return changed;
+    }
     async function rememberAmsLoad(pid, fil) {
         const prn = getPrinter(pid);
         if (!prn || !(fil || []).some((f) => f.spoolId)) return null;
@@ -6963,12 +7035,14 @@ create trigger layervault_touch
         const loaded = { ...prev };
         plan.rows.forEach((r) => { if (r.spoolId) loaded[r.n] = r.spoolId; });
         await saveRecord('printers', { ...prn, amsLoaded: loaded, amsLoadedAt: Date.now() });
-        return { pid, prev };
+        const others = await takeSpoolsFromOtherPrinters(pid, plan.rows.map((r) => r.spoolId));
+        return { pid, prev, others };
     }
     async function undoAmsLoad(mem) {
         const prn = mem && getPrinter(mem.pid);
         if (!prn) return;
         await saveRecord('printers', { ...prn, amsLoaded: mem.prev });
+        for (const o of mem.others || []) { const p = getPrinter(o.pid); if (p) await saveRecord('printers', { ...p, amsLoaded: o.prev }); }
     }
     function toggleStageAms(id, el) {
         const key = planKey(id, stageKeyOf(el) ? { key: stageKeyOf(el) } : null);
@@ -7029,10 +7103,12 @@ create trigger layervault_touch
         const cur = getPrinter(id);
         if (!cur) return;
         await saveRecord('printers', { ...cur, amsLoaded: next, amsLoadedAt: Date.now() });
+        const moved = await takeSpoolsFromOtherPrinters(id, Object.values(next));
         renderPrinters();
         renderPlan();
         renderOrders();
-        showToast(`Zapisano załadunek AMS: ${prn.name}.`);
+        const movedTxt = moved.length ? ` Te szpule zdjąłem z AMS: ${moved.map((m) => (getPrinter(m.pid) || {}).name).filter(Boolean).join(', ')}.` : '';
+        showToast(`Zapisano załadunek AMS: ${prn.name}.${movedTxt}`, moved.length ? 6000 : 3500);
     }
 
     /* ---------- Plan druku ----------
@@ -8304,7 +8380,8 @@ create trigger layervault_touch
                 o.hoursSplit.forEach((h) => { const pr = getPrinter(h.printerId); const n = pr ? pr.name : 'Bez drukarki'; prns.set(n, (prns.get(n) || 0) + (Number(h.hours) || 0)); });
                 return;
             }
-            const pr = getPrinter(o.printerId); const n = pr ? pr.name : 'Bez drukarki'; prns.set(n, (prns.get(n) || 0) + (Number(o.hours) || 0));
+            // Drukarka, której licznik dostał godziny przy rozliczeniu (może być inna niż w wycenie)
+            const pr = getPrinter(o.hoursPrinterId) || getPrinter(o.printerId); const n = pr ? pr.name : 'Bez drukarki'; prns.set(n, (prns.get(n) || 0) + (Number(o.hours) || 0));
         });
         return {
             r, rev: round2(rev), orderCost, expCost, profit: round2(rev - orderCost - expCost), count: incomes.length,
@@ -8893,6 +8970,25 @@ create trigger layervault_touch
             return t >= a && t < b ? sum + (Number(f.revenue) || 0) : sum;
         }, 0);
     }
+    // Stan limitu w bieżącym kwartale; extra = przychód, który zaraz dojdzie. null = licznik wyłączony.
+    function limitState(extra = 0) {
+        if (limitCfg().enabled === false) return null;
+        const qt = quarterOf(Date.now());
+        const lim = quarterLimit(qt.y).value;
+        const rev = round2(revenueBetween(qt.start, qt.end));
+        const after = round2(rev + (Number(extra) || 0));
+        return { qt, lim, rev, after, pct: lim > 0 ? after / lim * 100 : 0, left: Math.max(0, round2(lim - after)) };
+    }
+    // Zlecenia jeszcze niewydane: ich ceny dojdą do przychodu, gdy zostaną rozliczone
+    function queuedRevenue() {
+        const list = state.orders.filter((o) => !o.booked && Number(o.price) > 0);
+        return { count: list.length, sum: round2(list.reduce((a, o) => a + Number(o.price), 0)) };
+    }
+    function limitBannerKey(ls) { return `${ls.qt.y}Q${ls.qt.q}:${ls.pct >= 100 ? 100 : 80}`; }
+    function hideLimitBanner(el) {
+        safeStorage.set('lv_limit_banner_hide', (el && el.dataset && el.dataset.key) || '');
+        renderBanners();
+    }
     function renderLimitCard() {
         const el = $('finLimitCard');
         if (!el) return;
@@ -8911,6 +9007,13 @@ create trigger layervault_touch
         let note = '';
         if (pct >= 100) note = `<p class="text-xs text-rose-200 bg-rose-500/10 border border-rose-500/40 rounded-xl px-3 py-2" data-limit-note="over">Limit przekroczony. Według przepisów od dnia przekroczenia sprzedaż jest działalnością gospodarczą – na wpis do CEIDG jest 7 dni. Skonsultuj to z księgowym.</p>`;
         else if (pct >= 80) note = `<p class="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/40 rounded-xl px-3 py-2" data-limit-note="near">Zbliżasz się do limitu – do końca kwartału (${endDate}) zostało ${fmt(left)}.</p>`;
+        // Prognoza: zlecenia, które jeszcze czekają na wydanie
+        const qd = queuedRevenue();
+        if (qd.count && lim.value > 0) {
+            const fPct = (rev + qd.sum) / lim.value * 100;
+            const fCls = fPct >= 100 ? 'text-rose-300' : fPct >= 80 ? 'text-amber-300' : 'text-slate-400';
+            note += `<p class="text-xs ${fCls}" data-limit-forecast>Do wydania ${plural(qd.count, 'czeka', 'czekają', 'czeka')} ${qd.count} ${plural(qd.count, 'zlecenie', 'zlecenia', 'zleceń')} na ${fmt(qd.sum)}. Po ich rozliczeniu w tym kwartale: ${fmt(rev + qd.sum)} (${Math.round(fPct)}% limitu)${fPct >= 100 ? ` – o ${fmt(rev + qd.sum - lim.value)} ponad limit` : ''}.</p>`;
+        }
         el.innerHTML = `
             <div class="flex items-start justify-between gap-2">
                 <div class="min-w-0">
@@ -11165,6 +11268,8 @@ create trigger layervault_touch
         'hist-more': () => { histLimit += 50; renderHistory(); },
         'backup-now': () => exportDatabaseToJSON(),
         'backup-snooze': snoozeBackupReminder,
+        'limit-open': () => switchModule('finance'),
+        'limit-banner-hide': (id, el) => hideLimitBanner(el),
         'goto': (id) => switchModule(id)
     };
 
