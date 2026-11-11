@@ -1,5 +1,5 @@
 /* LayerVault 3D – service worker: działanie bez internetu i zawsze najnowsza wersja, gdy jest internet.
-   Własne pliki: najpierw sieć (aktualizacja z serwera), bez sieci – ostatnia zapisana kopia.
+   Własne pliki: najpierw sieć (z pominięciem pamięci przeglądarki – serwer trzyma pliki 10 minut), bez sieci – ostatnia zapisana kopia.
    Biblioteki z CDN (synchronizacja, skaner, .3mf): zapamiętane po pierwszym użyciu. */
 const CACHE = 'lv3d-v1';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png', './apple-touch-icon.png'];
@@ -15,10 +15,10 @@ self.addEventListener('activate', (event) => {
     );
 });
 
-function fromNetwork(request, timeoutMs) {
+function withTimeout(promise, timeoutMs) {
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
-        fetch(request).then((res) => { clearTimeout(timer); resolve(res); }, (err) => { clearTimeout(timer); reject(err); });
+        promise.then((v) => { clearTimeout(timer); resolve(v); }, (err) => { clearTimeout(timer); reject(err); });
     });
 }
 
@@ -27,12 +27,16 @@ self.addEventListener('fetch', (event) => {
     if (req.method !== 'GET') return;
     const url = new URL(req.url);
     if (url.origin === self.location.origin) {
+        // Numer wersji zawsze prosto z serwera (i nigdy do pamięci) – po nim aplikacja poznaje, że jest nowsza
+        if (url.pathname.endsWith('/version.json')) return;
+        // cache: 'no-cache' = zapytaj serwer, czy plik się zmienił (bez tego nowa wersja pojawiała się nawet po 10 minutach)
+        const net = fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' })
+            .then((res) => ({ res, copy: res && res.ok ? res.clone() : null }));
+        // Zapis także wtedy, gdy odpowiedź przyszła po czasie – następny start bez internetu ma już nową wersję
+        event.waitUntil(net.then(({ copy }) => (copy ? caches.open(CACHE).then((c) => c.put(req, copy)) : null)).catch(() => {}));
         event.respondWith(
-            fromNetwork(req, 4000)
-                .then((res) => {
-                    if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
-                    return res;
-                })
+            withTimeout(net, 4000)
+                .then(({ res }) => res)
                 .catch(() => caches.match(req, { ignoreSearch: true })
                     .then((hit) => hit || (req.mode === 'navigate' ? caches.match('./index.html') : Response.error())))
         );
