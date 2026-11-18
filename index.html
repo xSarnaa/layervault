@@ -1210,6 +1210,14 @@
                     <div><label for="prnInterval" class="block text-xs font-semibold text-slate-300 mb-1">Przegląd co (h druku)</label><input type="number" id="prnInterval" min="0" step="1" inputmode="numeric" placeholder="np. 150" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm"></div>
                     <div><label for="prnServiceNote" class="block text-xs font-semibold text-slate-300 mb-1">Co robić przy przeglądzie</label><input type="text" id="prnServiceNote" maxlength="200" placeholder="np. smarowanie osi, czyszczenie dyszy" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm"></div>
                 </div>
+                <div id="prnHoursBox" role="group" aria-labelledby="prnHoursTitle" class="border-t border-slate-800 pt-3 space-y-2">
+                    <h4 id="prnHoursTitle" class="text-sm font-bold text-slate-200">Godziny pracy</h4>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div><label for="prnTotalHours" class="block text-xs font-semibold text-slate-300 mb-1">Łącznie (h)</label><input type="text" id="prnTotalHours" inputmode="decimal" autocomplete="off" data-dec placeholder="0" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm tabular-nums"></div>
+                        <div><label for="prnServiceHours" class="block text-xs font-semibold text-slate-300 mb-1">Od przeglądu (h)</label><input type="text" id="prnServiceHours" inputmode="decimal" autocomplete="off" data-dec placeholder="0" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2.5 text-sm tabular-nums"></div>
+                    </div>
+                    <p class="text-xs text-slate-400">Rosną same przy rozliczaniu zleceń i nieudanych wydrukach. Wpisz własne, jeśli drukarka pracowała już wcześniej (np. stan z ekranu drukarki) albo licznik się rozjechał.</p>
+                </div>
                 <div class="flex gap-2">
                     <button type="submit" id="prnSubmitBtn" class="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold min-h-12 rounded-xl text-sm">Dodaj drukarkę</button>
                     <button type="button" id="prnCancelEditBtn" onclick="cancelPrinterEdit()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold min-h-12 px-5 rounded-xl text-sm">Anuluj</button>
@@ -2757,7 +2765,7 @@ create trigger layervault_touch
     let supabaseClientKey = '';
     /* Wersja aplikacji. Plik version.json obok aplikacji ma tę samą wartość; gdy na serwerze jest nowsza,
        otwarta aplikacja pokazuje baner „Jest nowa wersja” (nie trzeba zgadywać, czy odświeżenie coś da). */
-    const APP_VERSION = '12.11.2026 (8)';
+    const APP_VERSION = '18.11.2026 (9)';
     let newAppVersion = '', newVersionHidden = '', versionCheckedAt = 0;
     async function checkAppVersion(force) {
         if (IS_EMBEDDED || !/^https?:$/.test(location.protocol) || navigator.onLine === false) return;
@@ -12192,16 +12200,18 @@ create trigger layervault_touch
        DRUKARKI
        ===================================================================== */
     let editingPrinterId = null;
+    let prnHoursAtOpen = null;   // godziny pokazane przy otwarciu edycji – zapis zmienia tylko te, które poprawiono
     function setPrinterFormMode(editing) {
         $('prnFormTitle').textContent = editing ? 'Edycja drukarki' : 'Nowa drukarka';
         $('prnSubmitBtn').textContent = editing ? 'Zapisz zmiany' : 'Dodaj drukarkę';
         $('prnFormCard').classList.toggle('lv-editing', editing);
     }
     function resetPrinterForm() {
-        ['prnName', 'prnWatts', 'prnRate', 'prnInterval', 'prnServiceNote', 'prnDeprPrice', 'prnAmsSlots'].forEach((id) => { $(id).value = ''; });
+        ['prnName', 'prnWatts', 'prnRate', 'prnInterval', 'prnServiceNote', 'prnDeprPrice', 'prnAmsSlots', 'prnTotalHours', 'prnServiceHours'].forEach((id) => { $(id).value = ''; });
         $('prnDeprHours').value = '5000';
         updateDeprHelper('prn');
         editingPrinterId = null;
+        prnHoursAtOpen = null;
         setPrinterFormMode(false);
     }
     function openPrinterForm() {
@@ -12225,8 +12235,25 @@ create trigger layervault_touch
         $('prnInterval').value = p.interval || '';
         $('prnServiceNote').value = p.serviceNote || '';
         $('prnAmsSlots').value = Number(p.amsSlots) > 0 ? String(p.amsSlots) : '';
+        prnHoursAtOpen = { total: round2(p.totalHours), svc: round2(p.serviceHours) };
+        $('prnTotalHours').value = prnHoursAtOpen.total;
+        $('prnServiceHours').value = prnHoursAtOpen.svc;
         setPrinterFormMode(true);
         openFormCard('prnFormCard', 'prnNewBtn', 'prnName');
+    }
+    // „Zmień” przy godzinach pracy: formularz drukarki od razu przy polach licznika
+    function editPrinterHours(id) {
+        if (!getPrinter(id)) return;
+        editPrinter(id);
+        flashItem('#prnHoursBox');
+        if (window.matchMedia && window.matchMedia('(pointer: fine)').matches) { const el = $('prnTotalHours'); el.focus({ preventScroll: true }); el.select(); }
+    }
+    // Godziny z formularza: puste = 0, niepoprawne = NaN
+    function readHoursField(id) {
+        const t = String($(id).value || '').trim();
+        if (!t) return 0;
+        const v = parseDecimal(t);
+        return Number.isFinite(v) && v >= 0 && v <= 1000000 ? round2(v) : NaN;
     }
 
     async function addPrinter() { return exclusive('prn-save', doSavePrinter); }
@@ -12237,19 +12264,44 @@ create trigger layervault_touch
         const interval = readNum('prnInterval', 0);
         const amsRaw = String($('prnAmsSlots').value || '').trim();
         const amsSlots = amsRaw ? Math.floor(Number(amsRaw)) : 4;
+        const total = readHoursField('prnTotalHours'), svc = readHoursField('prnServiceHours');
         const invalid = [];
         if (!(amsSlots >= 1 && amsSlots <= 32)) invalid.push('prnAmsSlots');
         if (!name) invalid.push('prnName');
         if (!(watts > 0)) invalid.push('prnWatts');
         if (!(rate >= 0)) invalid.push('prnRate');
         if (interval < 0) invalid.push('prnInterval');
-        if (invalid.length) { markInvalid(...invalid); return showToast(invalid.includes('prnAmsSlots') && invalid.length === 1 ? 'Sloty AMS: liczba od 1 do 32.' : 'Podaj nazwę, moc (W) i amortyzację (zł/h).'); }
+        if (!Number.isFinite(total)) invalid.push('prnTotalHours');
+        if (!Number.isFinite(svc)) invalid.push('prnServiceHours');
+        if (invalid.length) {
+            markInvalid(...invalid);
+            const only = (...ids) => invalid.every((x) => ids.includes(x));
+            return showToast(only('prnAmsSlots') ? 'Sloty AMS: liczba od 1 do 32.'
+                : only('prnTotalHours', 'prnServiceHours') ? 'Godziny pracy: wpisz liczbę od 0 wzwyż, np. 523,5.'
+                : 'Podaj nazwę, moc (W) i amortyzację (zł/h).');
+        }
         const existing = editingPrinterId ? getPrinter(editingPrinterId) : null;
         if (editingPrinterId && !existing) { closePrinterForm(); return showToast('Edytowana drukarka już nie istnieje.'); }
+        // Godziny pracy: zmienia się tylko to, co poprawiono w formularzu (w tym czasie mogły dojść godziny z innego urządzenia)
+        const before = existing ? { total: round2(existing.totalHours), svc: round2(existing.serviceHours) } : null;
+        const shown = existing ? prnHoursAtOpen || before : null;
+        const chTotal = !!existing && Math.abs(total - shown.total) >= 0.005;
+        const chSvc = !!existing && Math.abs(svc - shown.svc) >= 0.005;
+        const newTotal = existing ? (chTotal ? total : before.total) : total;
+        const newSvc = existing ? (chSvc ? svc : before.svc) : svc;
+        if ((!existing || chTotal || chSvc) && newSvc > newTotal + 0.001) {
+            markInvalid(existing && !chSvc ? 'prnTotalHours' : 'prnServiceHours');
+            return showToast(`Od przeglądu (${fmtNum(newSvc)} h) nie może być więcej niż łącznie (${fmtNum(newTotal)} h).`, 6000);
+        }
         const fields = { name, watts, rate, interval: Math.round(interval), serviceNote: $('prnServiceNote').value.trim(), amsSlots };
         const item = existing
             ? { ...existing, ...fields }
-            : { id: uid('prn'), ...fields, totalHours: 0, serviceHours: 0, created_at: Date.now() };
+            : { id: uid('prn'), ...fields, totalHours: total, serviceHours: svc, created_at: Date.now() };
+        const setHours = [chTotal && 'totalHours', chSvc && 'serviceHours'].filter(Boolean);
+        if (chTotal) item.totalHours = total;
+        if (chSvc) item.serviceHours = svc;
+        // Ręczna zmiana licznika: przy łączeniu z innym urządzeniem liczy się ta wartość + godziny dopisane tam później
+        if (setHours.length) markCounterSet(item, ...setHours);
         await saveRecord('printers', item);
         // Edytowana drukarka wybrana w kalkulatorze → nowe parametry od razu w wycenie
         if (existing && $('calcPrinterSelect').value === item.id) fillPrinterParams(item);
@@ -12257,7 +12309,24 @@ create trigger layervault_touch
         refreshCalculatorPickers();
         recalculate();
         renderPrinters();
-        showToast(existing ? 'Zapisano zmiany drukarki.' : `Dodano drukarkę: ${name}.`);
+        if (setHours.length) {
+            const id = item.id;
+            const what = [chTotal ? `łącznie ${fmtNum(before.total)} → ${fmtNum(total)} h` : '', chSvc ? `od przeglądu ${fmtNum(before.svc)} → ${fmtNum(svc)} h` : ''].filter(Boolean).join(', ');
+            return showToast(`Zapisano zmiany drukarki. Godziny pracy: ${what}.`, 8000, {
+                label: 'Cofnij',
+                fn: async () => {
+                    const cur = getPrinter(id);
+                    if (!cur) return;
+                    if (chTotal) cur.totalHours = before.total;
+                    if (chSvc) cur.serviceHours = before.svc;
+                    markCounterSet(cur, ...setHours);
+                    await saveRecord('printers', cur);
+                    renderPrinters();
+                    showToast('Przywrócono poprzednie godziny pracy.');
+                }
+            });
+        }
+        showToast(existing ? 'Zapisano zmiany drukarki.' : `Dodano drukarkę: ${name}.${total > 0 ? ` Godziny pracy na start: ${fmtNum(total)} h.` : ''}`);
     }
     async function markPrinterServiced(id) {
         const p = getPrinter(id);
@@ -12313,17 +12382,21 @@ create trigger layervault_touch
             <div class="bg-slate-950 border ${due ? 'border-amber-500/50' : 'border-slate-800'} p-3 rounded-xl space-y-2.5" data-printer-card="${eid}">
                 <div class="min-w-0">
                     <div class="font-bold text-slate-100 break-words">${escapeHtml(p.name)}</div>
-                    <div class="text-xs text-slate-400">${Number(p.watts) || 0} W • amortyzacja ${fmt(p.rate)}/h • łącznie ${round1(p.totalHours)} h druku${p.lastServiceAt ? ` • ostatni przegląd ${fmtDate(p.lastServiceAt)}` : ''}</div>
+                    <div class="text-xs text-slate-400">${Number(p.watts) || 0} W • amortyzacja ${fmt(p.rate)}/h${p.lastServiceAt ? ` • ostatni przegląd ${fmtDate(p.lastServiceAt)}` : ''}</div>
                     ${(() => {
                         const n = printerAmsSlots(p);
                         const ld = p.amsLoaded && typeof p.amsLoaded === 'object' ? p.amsLoaded : {};
                         const txt = Array.from({ length: n }, (_, i) => { const sp = getSpool(ld[i + 1]); return sp ? `${i + 1}: ${spoolCode(sp) || sp.color || '?'}` : ''; }).filter(Boolean);
                         return `<div class="text-xs text-slate-400" data-printer-ams>AMS: ${n} ${plural(n, 'slot', 'sloty', 'slotów')}${txt.length ? ` • założone ${escapeHtml(txt.join(' · '))}` : ' • nic nie zapisano'}</div>`;
                     })()}
+                    <div class="flex items-center justify-between gap-2 mt-1" data-printer-hours>
+                        <span class="text-sm text-slate-300">Godziny pracy: <b class="text-slate-100 tabular-nums">${fmtNum(p.totalHours)} h</b></span>
+                        <button type="button" data-act="prn-hours" data-id="${eid}" class="min-h-11 px-3 rounded-xl text-xs font-semibold text-indigo-300 hover:bg-slate-800 inline-flex items-center gap-1.5 shrink-0" aria-label="Zmień godziny pracy: ${escapeHtml(p.name)}">${icon('pen')} Zmień</button>
+                    </div>
                 </div>
                 ${interval ? `
                 <div>
-                    <div class="flex justify-between text-xs ${due ? 'text-amber-300 font-bold' : 'text-slate-400'}"><span>${due ? '🔧 Czas na przegląd!' : 'Do przeglądu'}</span><span class="tabular-nums">${round1(svc)} / ${interval} h</span></div>
+                    <div class="flex justify-between text-xs ${due ? 'text-amber-300 font-bold' : 'text-slate-400'}"><span>${due ? '🔧 Czas na przegląd!' : 'Do przeglądu'}</span><span class="tabular-nums">${fmtNum(svc, 1)} / ${interval} h</span></div>
                     <div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden mt-1"><div class="${due ? 'bg-amber-500' : 'bg-indigo-500'} h-full" style="width:${pct.toFixed(1)}%"></div></div>
                     ${p.serviceNote ? `<div class="text-xs text-slate-300 mt-1.5">Przy przeglądzie: ${escapeHtml(p.serviceNote)}</div>` : ''}
                 </div>` : ''}
@@ -12427,6 +12500,7 @@ create trigger layervault_touch
         'acc-delete': deleteAccessory,
         'prn-service': markPrinterServiced,
         'prn-edit': editPrinter,
+        'prn-hours': editPrinterHours,
         'prn-delete': deletePrinter,
         'hist-load': (id) => loadHistoryQuote(id),
         'hist-order': orderFromHistory,
